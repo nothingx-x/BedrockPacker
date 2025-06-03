@@ -12,10 +12,12 @@
 from enum import Enum, auto
 import os
 from pathlib import Path
+import shutil
 import time
 import zipfile
 from colorama import init
-import watchdog
+import watchdog.events
+import watchdog.observers
 from pubsub import pub
 
 
@@ -37,6 +39,8 @@ class EventType(Enum):
     SUCCESS_UNZIP_FILES_UI = "bedrock_packer.success_unzip_files"
     HELP_UI = "bedrock_packer.help"
 
+    CLEAR_CONSOLE_UI = "bedrock_packer.clear_console"
+
 
 class Option:
     """
@@ -51,6 +55,34 @@ class Option:
 
     def __str__(self):
         return f"{self.value} - {self.description}"
+
+
+class Extractor:
+    def __init__(self) -> None:
+        pass
+
+    def extractAll(self, base_path: str, file: str):
+        if not self.__isZip(file):
+            raise Exception("File is not a zip file")
+
+        # zip file
+        file_path = os.path.join(base_path, file)
+        abs_file_path = os.path.abspath(file_path)
+        # extracted folder (will be same folder as zip file)
+        extracted_folder_path = os.path.join(
+            base_path, os.path.splitext(os.path.basename(file))[0]
+        )
+        abs_extracted_folder_path = os.path.abspath(extracted_folder_path)
+
+        try:
+            with zipfile.ZipFile(abs_file_path, "r") as zip_ref:
+                zip_ref.extractall(abs_extracted_folder_path)
+
+        except Exception as e:
+            raise e
+
+    def __isZip(self, file: str) -> bool:
+        return file.endswith(".zip")
 
 
 # Default startup options array
@@ -89,6 +121,13 @@ class BedrockPackerUI:
             self.run_error_create_target_directory_ui,
             EventType.ERROR_CREATE_TARGET_DIRECTORY_UI.value,
         )
+        pub.subscribe(
+            self.run_clear_console_ui, EventType.CLEAR_CONSOLE_UI.value
+        )
+
+    def run_clear_console_ui(self):
+        self.__clear_console()
+
 
     def run_main_ui(self):
         self.__clear_console()
@@ -133,6 +172,7 @@ class BedrockPackerApp:
             Path.home(),
             "AppData/Local/Packages/Microsoft.MinecraftUWP_8wekyb3d8bbwe/LocalCache/minecraftpe/ResPackDownloads",
         )
+        self.__extractor = Extractor()
 
     def run(self):
         """
@@ -144,32 +184,56 @@ class BedrockPackerApp:
                 pub.sendMessage(EventType.MAIN_UI.value)
                 option = input("Your option:\n")
                 self.handle_option(int(option))
-                pass
+
         except KeyboardInterrupt:
             self.handle_exit()
 
     def handle_option(self, option: int):
         if option == options[0].value:
             self.handle_watch()
-            pass
+
         elif option == options[1].value:
             self.handle_target_directory()
-            pass
+
         elif option == options[2].value:
             self.handle_unzip_files()
 
         elif option == options[3].value:
             self.handle_help()
-            pass
+
         elif option == options[4].value:
             self.handle_exit()
-            pass
+
         else:
             print("Unknown option")
             exit(-1)
 
     def handle_watch(self):
-        pass
+        event_handler = watchdog.events.FileSystemEventHandler()
+        event_handler.on_created = self.on_created
+        event_handler.on_modified = self.on_modified
+        observer = watchdog.observers.Observer()
+        observer.schedule(event_handler, path=self.__mc_path, recursive=True)
+
+        observer.start()
+        print("Watching for changes..., Press Ctrl+C to stop")
+
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            observer.stop()
+            observer.join()
+
+    def on_created(self, event):
+        print(f"File created: {event.src_path}")
+        # copy file to target directory
+        shutil.copy(event.src_path, self.path)
+
+    def on_modified(self, event):
+        print(f"File modified: {event.src_path}")
+        # copy file to target directory
+        shutil.copy(event.src_path, self.path)
 
     def handle_target_directory(self):
         """
@@ -183,6 +247,7 @@ class BedrockPackerApp:
         target_dir = input().strip()  # remove whitespaces
 
         target_dir = os.path.join(target_dir, self.__folder_name)
+
         try:
             if not os.path.exists(target_dir) and self.path != target_dir:
                 self.path = target_dir
@@ -195,12 +260,18 @@ class BedrockPackerApp:
                     EventType.SUCCESS_CREATE_TARGET_DIRECTORY_UI.value,
                     target_dir=target_dir,
                 )
-
             elif os.path.isfile(target_dir):
                 pub.sendMessage(
                     EventType.ERROR_CREATE_TARGET_DIRECTORY_UI.value,
                     error="Target directory is a file",
                 )
+            elif self.path != target_dir:
+                self.path = target_dir
+                pub.sendMessage(
+                    EventType.SUCCESS_SET_TARGET_DIRECTORY_UI.value,
+                    target_dir=target_dir,
+                )
+
             else:
                 pub.sendMessage(
                     EventType.ERROR_CREATE_TARGET_DIRECTORY_UI.value,
@@ -209,31 +280,14 @@ class BedrockPackerApp:
         except Exception as e:
             pub.sendMessage(EventType.ERROR_CREATE_TARGET_DIRECTORY_UI.value, error=e)
             exit(-1)
-        pass
 
     def handle_unzip_files(self):
         for file in os.listdir(self.path):
-            if not file.endswith(".zip"):
-                continue
-
-            # zip file
-            file_path = os.path.join(self.path, file)
-            abs_file_path = os.path.abspath(file_path)
-            # extracted folder (will be same folder as zip file)
-            extracted_folder_path = os.path.join(
-                self.path, os.path.splitext(os.path.basename(file))[0]
-            )
-            abs_extracted_folder_path = os.path.abspath(extracted_folder_path)
-
             try:
-                with zipfile.ZipFile(abs_file_path, "r") as zip_ref:
-                    zip_ref.extractall(abs_extracted_folder_path)
-
-                print("Successfully unzipped files")
+                self.__extractor.extractAll(self.path, file)
+                print(f"File {file} sucessfully extracted!")
             except Exception as e:
-                print(f"Error: {e}")
-                exit(-1)
-                
+                print(f"Error while extracting file {file}, Error:{e}")
 
     def handle_help(self):
         pass
